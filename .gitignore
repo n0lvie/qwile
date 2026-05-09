@@ -1,0 +1,8 @@
+# Qwile's memory — unique to each instance
+self/*
+!self/README.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
