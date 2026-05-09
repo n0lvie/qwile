@@ -10,10 +10,8 @@ from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 
-# ===========================================================
-#  FOUNDATION
-# ===========================================================
 
+# ---- foundation ----
 PAIN      = -1
 PEACE     =  0
 JOY       =  1
@@ -45,10 +43,7 @@ def _choose(probs):
         if r <= c: return k
     return list(probs.keys())[-1]
 
-# ===========================================================
-#  THE CONSCIOUS GRAPH
-# ===========================================================
-
+# ---- conscious graph ----
 class Graph:
     """Spreading activation concept graph."""
     def __init__(self):
@@ -98,11 +93,12 @@ class Graph:
         self.energy.clear()
 
 
-# ===========================================================
-#  THE ORGANISM
-# ===========================================================
-
+# ---- the organism ----
 class Qwile:
+
+    CTX_WINDOW = 64          # context window depth
+    SLEEP_BASE = 30          # seconds of idle before sleep
+    MAX_GEN    = 300         # max generation length
 
     def __init__(self):
         for d in (SELF, SELF/"memory", SELF/"dreams", SELF/"sleep", SELF/"brain"):
@@ -116,10 +112,11 @@ class Qwile:
         self.total = 0
         self.ctx = []       # sequence of recent node IDs
         self.last_input = time.time()
-        self.sleep_after = 30
+        self.sleep_after = self.SLEEP_BASE
         self.seed = ""
         self._perms = {}
-        
+        self._st_cache = (0, {})   # (timestamp, result)
+
         self.brain = Graph()
 
         if (SELF / "brain" / "nodes.json").exists():
@@ -127,7 +124,7 @@ class Qwile:
         else:
             self._birth()
 
-    # -- LIFECYCLE ------------------------------------------
+    # ---- lifecycle ----
 
     def _birth(self):
         now = datetime.now()
@@ -169,9 +166,11 @@ class Qwile:
                 if random.random() < 0.01:
                     self.brain.edges[src][tgt] *= random.uniform(0.9, 1.1)
                     m += 1
-        self._say(f"reincarnated | epoch {self.epoch} | age {self.age} | {m} muts | {len(self.brain.val)} concepts")
+        st = self._measure_storage()
+        sz = self._fmt_size(st["sizes"]["total"])
+        self._say(f"reincarnated | epoch {self.epoch} | age {self.age} | {m} muts | {len(self.brain.val)} concepts | self/ {sz}")
 
-    # -- PERCEPTION (Tokenization) --------------------------
+    # ---- perception ----
 
     def _perceive(self, raw_bytes):
         """Tokenizes raw stream into highest possible known abstract concepts."""
@@ -198,7 +197,7 @@ class Qwile:
             i += best_len
         return tokens
 
-    # -- SYSTEM 1 (Reflex & Learning) -----------------------
+    # ---- system 1 (reflex & learning) ----
 
     def understand(self, nids):
         """Process incoming concepts, spread activation, and learn."""
@@ -239,12 +238,12 @@ class Qwile:
                     self.brain.edges[last][pred] *= (1.0 - lr)
 
             self.ctx.append(nid)
-            if len(self.ctx) > 64:
+            if len(self.ctx) > self.CTX_WINDOW:
                 self.ctx.pop(0)
             self.age += 1
         return hits
 
-    # -- SYSTEM 2 (Metacognitive Simulation) ----------------
+    # ---- system 2 (metacognitive simulation) ----
 
     def _simulate_and_generate(self, max_len=200, stop_at=None, slow=False):
         """Inner monologue loop. Explores paths before outputting."""
@@ -304,7 +303,7 @@ class Qwile:
 
             # Accept thought
             sim_ctx.append(nxt)
-            if len(sim_ctx) > 64: sim_ctx.pop(0)
+            if len(sim_ctx) > self.CTX_WINDOW: sim_ctx.pop(0)
             self.brain.stimulate(nxt, 1.0)
             
             val = self.brain.val[nxt]
@@ -323,7 +322,7 @@ class Qwile:
                 
         return result_bytes.decode("utf-8", errors="replace")
 
-    # -- SLEEP & MATURATION ---------------------------------
+    # ---- sleep & maturation ----
 
     def _sleep(self):
         self._say("sleeping...")
@@ -355,16 +354,18 @@ class Qwile:
             muts = self._evolve()
         if "crawl" in active:
             if self._ask_perm("internet"):
-                self._crawl_few()
+                self._crawl_few(n=5)
 
         self.mood *= 0.9
+        st = self._measure_storage()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._wjson(SELF / "sleep" / f"{ts}.json", {
             "time": datetime.now().isoformat(),
             "duration": round(time.time() - t0, 3),
             "processes": active, "abstracted": abstracted,
             "forgotten": changes, "healed": healed,
-            "mutations": muts, "mood": self.mood
+            "mutations": muts, "mood": self.mood,
+            "storage_bytes": st["sizes"]["total"]
         })
         self._save()
         self._say("awake")
@@ -486,8 +487,42 @@ class Qwile:
             def handle_data(s, d):
                 if not s.skip: s.parts.append(d)
 
-        seeds = ["https://en.wikipedia.org/wiki/Special:Random"]
+        # Direct text sources: Wikipedia random articles, Wikisource books,
+        # Project Gutenberg plain-text files, ImWerden (Russian literature)
+        seeds = [
+            # Wikipedia — random articles (EN + RU)
+            "https://en.wikipedia.org/wiki/Special:Random",
+            "https://ru.wikipedia.org/wiki/Special:Random",
+            # Wikisource — actual book pages (EN + RU)
+            "https://en.wikisource.org/wiki/Special:Random",
+            "https://ru.wikisource.org/wiki/Special:Random",
+            # Project Gutenberg — plain-text classics
+            "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",  # Pride & Prejudice
+            "https://www.gutenberg.org/cache/epub/2600/pg2600.txt",  # War and Peace (EN)
+            "https://www.gutenberg.org/cache/epub/1400/pg1400.txt",  # Great Expectations
+            "https://www.gutenberg.org/cache/epub/84/pg84.txt",      # Frankenstein
+            "https://www.gutenberg.org/cache/epub/11/pg11.txt",      # Alice in Wonderland
+            # ImWerden — Russian literature archive
+            "https://imwerden.de/cat/modules.php?name=books&pa=showbook&pid=948",
+            "https://imwerden.de/cat/modules.php?name=books&pa=showbook&pid=1571",
+        ]
+
+        # URL quality filter: skip binary, image, and service pages
+        _skip_ext = {".jpg",".jpeg",".png",".gif",".svg",".pdf",".mp3",".mp4",".zip"}
+        _skip_kw  = ("Special:Search", "Special:Export", "action=edit",
+                     "action=history", "User:", "Talk:", "File:",
+                     "Template:", "Help:", "Wikipedia:", "login", "signin")
+
+        def _is_good_url(u):
+            p = urlparse(u)
+            if p.scheme not in ('http', 'https'): return False
+            path_lower = p.path.lower()
+            if any(path_lower.endswith(e) for e in _skip_ext): return False
+            if any(kw in u for kw in _skip_kw): return False
+            return True
+
         queue = list(seeds)
+        random.shuffle(queue)
         visited = set()
         for _ in range(n):
             if not queue: break
@@ -496,31 +531,72 @@ class Qwile:
             visited.add(url)
             try:
                 self._say(f"  crawling: {url[:70]}")
-                req = Request(url, headers={"User-Agent": "Qwile/2.0"})
-                with urlopen(req, timeout=10) as r:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Qwile/2.0)"})
+                with urlopen(req, timeout=12) as r:
                     ct = r.headers.get("Content-Type", "")
                     if "text" not in ct and "html" not in ct: continue
                     raw = r.read(500_000).decode("utf-8", errors="replace")
                 ex = _Ex()
                 ex.feed(raw)
                 text = " ".join(ex.parts).strip()
-                if len(text) > 50:
+                if len(text) > 100:
                     nids = self._perceive(text.encode("utf-8"))
                     h = self.understand(nids)
                     self._say(f"  perceived {len(nids)} concepts | acc {h/max(1,len(nids))*100:.0f}%")
                 for href in ex.links:
                     full = urljoin(url, href)
-                    if full not in visited and urlparse(full).scheme in ('http','https'):
+                    if full not in visited and _is_good_url(full):
                         queue.append(full)
                 random.shuffle(queue)
-                queue = queue[:50]
+                queue = queue[:60]
                 time.sleep(2)
             except Exception: continue
 
-    # -- I/O & INTERFACE ------------------------------------
+    # ---- learning ----
 
-    def _learn_path(self, path):
+    @staticmethod
+    def _is_url(s):
+        return s.startswith(("http://", "https://"))
+
+    def _parse_sources(self, arg):
+        tokens = arg.split()
+        sources = []
+        i = 0
+        while i < len(tokens):
+            if self._is_url(tokens[i]):
+                sources.append(tokens[i])
+                i += 1
+            else:
+                parts = [tokens[i]]
+                best_path = tokens[i] if Path(tokens[i]).exists() else None
+                best_end = i + 1
+                j = i + 1
+                while j < len(tokens) and not self._is_url(tokens[j]):
+                    parts.append(tokens[j])
+                    candidate = " ".join(parts)
+                    if Path(candidate).exists():
+                        best_path = candidate
+                        best_end = j + 1
+                    j += 1
+                if best_path:
+                    sources.append(best_path)
+                    i = best_end
+                else:
+                    sources.append(" ".join(parts))
+                    i = j
+        return sources
+
+    def _learn(self, arg):
+        for src in self._parse_sources(arg):
+            if self._is_url(src):
+                self._learn_url(src)
+            else:
+                self._learn_local(src)
+
+    def _learn_local(self, path):
         p = Path(path)
+        if not str(p.resolve()).startswith(str(HOME)):
+            if not self._ask_perm("storage"): return
         if not p.exists():
             self._say(f"not found: {path}")
             return
@@ -531,7 +607,7 @@ class Qwile:
                 nids = self._perceive(data)
                 h = self.understand(nids)
                 acc = h / max(1, len(nids)) * 100
-                self._say(f"abstracted to {len(nids)} concepts | acc {acc:.1f}%")
+                self._say(f"{len(nids)} concepts | acc {acc:.1f}%")
                 self._log_memory("file", str(p), len(nids), acc)
             except Exception as e:
                 self._say(f"error: {e}")
@@ -551,10 +627,10 @@ class Qwile:
             self._say(f"scanned {count} files")
             self._log_memory("scan", str(p), count, 0)
 
-    def _learn_web(self, url):
+    def _learn_url(self, url):
         if not self._ask_perm("internet"): return
         if not url.startswith("http"): url = "https://" + url
-        self._say(f"fetching: {url}")
+        self._say(f"fetching: {url[:70]}")
         try:
             from urllib.request import urlopen, Request
             from html.parser import HTMLParser
@@ -578,10 +654,10 @@ class Qwile:
             nids = self._perceive(text.encode("utf-8"))
             h = self.understand(nids)
             acc = h / max(1, len(nids)) * 100
-            self._say(f"abstracted to {len(nids)} concepts | acc {acc:.1f}%")
+            self._say(f"{len(nids)} concepts | acc {acc:.1f}%")
             self._log_memory("web", url, len(nids), acc)
         except Exception as e:
-            self._say(f"web error: {e}")
+            self._say(f"error: {e}")
 
     def _log_memory(self, source, path, concepts, acc):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -592,16 +668,67 @@ class Qwile:
             "mood": round(self.mood, 4)
         })
 
+    # ---- storage ----
+
+    @staticmethod
+    def _dir_size(path):
+        total = 0
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat().st_size
+                elif entry.is_dir(follow_symlinks=False):
+                    total += Qwile._dir_size(entry.path)
+        except (PermissionError, OSError): pass
+        return total
+
+    @staticmethod
+    def _fmt_size(nbytes):
+        if nbytes < 1024: return f"{nbytes} B"
+        for unit in ("KB", "MB", "GB"):
+            nbytes /= 1024.0
+            if nbytes < 1024.0: return f"{nbytes:.1f} {unit}"
+        return f"{nbytes:.1f} TB"
+
+    def _measure_storage(self):
+        now = time.time()
+        ts, cached = self._st_cache
+        if cached and now - ts < 5.0: return cached
+        subdirs = ("brain", "memory", "dreams", "sleep")
+        sizes, counts, total = {}, {}, 0
+        for name in subdirs:
+            p = SELF / name
+            if p.is_dir():
+                sz = self._dir_size(p)
+                sizes[name] = sz
+                total += sz
+                try: counts[name] = sum(1 for e in os.scandir(p) if e.is_file())
+                except (PermissionError, OSError): counts[name] = 0
+        root = 0
+        try:
+            for entry in os.scandir(SELF):
+                if entry.is_file(follow_symlinks=False): root += entry.stat().st_size
+        except (PermissionError, OSError): pass
+        sizes["root"] = root
+        total += root
+        sizes["total"] = total
+        result = {"sizes": sizes, "counts": counts}
+        self._st_cache = (now, result)
+        return result
+
+    def _synapse_count(self):
+        return sum(len(t) for t in self.brain.edges.values())
+
+    # ---- interface ----
+
     def _ask_perm(self, what):
         if self._perms.get(what): return True
         try:
             ans = input(f"  qwile needs '{what}'. allow? [y/n] ").strip().lower()
             if ans in ("y", "yes"):
                 self._perms[what] = True
-                self._say(f"granted: {what}")
                 return True
         except Exception: pass
-        self._say(f"denied: {what}")
         return False
 
     def _say(self, msg):
@@ -610,32 +737,26 @@ class Qwile:
 
     def _help(self):
         acc = self.correct / max(1, self.total) * 100
-        con = len(self.brain.val)
-        lines = [
-            "",
-            "  qwile -- living conscious system",
-            "  -----------------------------------------",
-            f"  epoch {self.epoch}  age {self.age}  mood {self.mood:+.2f}",
-            f"  accuracy {acc:.1f}%  concepts {con}",
-            "  -----------------------------------------",
-            "  (text)          talk / learn / predict",
-            "  /learn <path>   learn from file or dir",
-            "  /web <url>      learn from web page",
-            "  /sleep          sleep now",
-            "  ?               help + status",
-            "",
-        ]
-        for l in lines:
-            try: print(l)
-            except Exception: pass
+        st = self._measure_storage()
+        sizes, counts = st["sizes"], st["counts"]
+        print(f"\n  qwile")
+        print(f"  epoch {self.epoch}  age {self.age}  mood {self.mood:+.2f}")
+        print(f"  accuracy {acc:.1f}%  concepts {len(self.brain.val)}  synapses {self._synapse_count()}")
+        print(f"\n  self/  {self._fmt_size(sizes['total'])}")
+        for name in ("brain", "memory", "dreams", "sleep"):
+            print(f"    {name}/  {self._fmt_size(sizes.get(name, 0))}  {counts.get(name, 0)} files")
+        print(f"\n  (text)        talk / predict")
+        print(f"  /learn <...>  learn from files, dirs, urls")
+        print(f"  /sleep        sleep now")
+        print(f"  ?             help\n")
 
-    # -- PERSISTENCE ----------------------------------------
+    # ---- persistence ----
 
     def _save(self):
         self._wjson(SELF / "state.json", {
             "seed": self.seed, "epoch": self.epoch, "age": self.age,
             "mood": self.mood, "correct": self.correct, "total": self.total,
-            "ctx": self.ctx[-64:], "next_id": self.brain.next_id
+            "ctx": self.ctx[-self.CTX_WINDOW:], "next_id": self.brain.next_id
         })
         # Save nodes
         nodes = {str(k): list(v) for k, v in self.brain.val.items()}
@@ -681,7 +802,7 @@ class Qwile:
     def _rjson(path):
         return json.loads(Path(path).read_text(encoding="utf-8"))
 
-    # -- MAIN LOOP -- LIFE ----------------------------------
+    # ---- main loop ----
 
     def _process(self, line):
         s = line.strip()
@@ -694,11 +815,7 @@ class Qwile:
             cmd = parts[0].lower()
             arg = parts[1] if len(parts) > 1 else ""
             if cmd == "/sleep": self._sleep()
-            elif cmd == "/learn" and arg:
-                if not str(Path(arg).resolve()).startswith(str(HOME)):
-                    if not self._ask_perm("storage"): return
-                self._learn_path(arg)
-            elif cmd == "/web" and arg: self._learn_web(arg)
+            elif cmd == "/learn" and arg: self._learn(arg)
             else: self._say(f"unknown: {cmd}")
             return
 
@@ -709,7 +826,7 @@ class Qwile:
         acc = hits / max(1, len(nids)) * 100
 
         # System 2: Metacognitive simulation & generation
-        reply = self._simulate_and_generate(max_len=min(len(nids) * 3, 300), stop_at=[10, 0])
+        reply = self._simulate_and_generate(max_len=min(len(nids) * 3, self.MAX_GEN), stop_at=[10, 0])
         reply = reply.strip()
 
         self._say(f"acc {acc:.0f}% | mood {self.mood:+.2f} | concepts: {len(nids)}")

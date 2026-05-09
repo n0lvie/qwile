@@ -134,7 +134,7 @@ That's it. Qwile is born.
 /learn <path>   learn from a file or directory
 /web <url>      learn from a web page
 /sleep          sleep now (abstract, dream, evolve, heal)
-?               help + status
+?               help + status + storage
 ```
 
 State is saved automatically on exit (`Ctrl+C`).
@@ -151,6 +151,10 @@ The more text Qwile processes, the better it predicts. Feed it books, code, conv
 ```
 
 After sufficient training on English text, Qwile will predict English. After Russian — Russian. After code — code. It learns the structure of whatever it receives.
+
+### Storage Monitoring
+
+`?` shows how much space `self/` occupies — total and per subdirectory (`brain/`, `memory/`, `dreams/`, `sleep/`) with file counts. Storage is also recorded in sleep logs for historical tracking.
 
 ---
 
