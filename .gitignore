@@ -1,6 +1,7 @@
 # Qwile's memory — unique to each instance
 self/*
 !self/README.md
+!qw1le.py
 
 # Python
 __pycache__/
