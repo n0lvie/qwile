@@ -105,7 +105,7 @@ class Graph:
 class Qwile:
 
     def __init__(self):
-        for d in [SELF, SELF/"memory", SELF/"dreams", SELF/"sleep", SELF/"brain"]:
+        for d in (SELF, SELF/"memory", SELF/"dreams", SELF/"sleep", SELF/"brain"):
             d.mkdir(parents=True, exist_ok=True)
 
         self.alive = True
@@ -394,7 +394,7 @@ class Qwile:
                 self.brain.add_edge(new_id, tgt, 1.0)
                 abstracted += 1
             except Exception:
-                pass
+                continue
         return abstracted
 
     def _forget(self):
@@ -417,7 +417,7 @@ class Qwile:
                 logs.sort(key=lambda f: f.stat().st_mtime)
                 for f in logs[:-50]:
                     try: f.unlink()
-                    except: pass
+                    except Exception: pass
         return forgotten
 
     def _heal(self):
@@ -449,11 +449,18 @@ class Qwile:
         return muts
 
     def _dream_aloud(self):
-        self._say("internal simulation...")
+        self._say("dreaming...")
         try:
             sys.stdout.write("  ")
-            self._simulate_and_generate(max_len=random.randint(20, 60), slow=True)
+            dream = self._simulate_and_generate(max_len=random.randint(20, 60), slow=True)
             print()
+            if dream.strip():
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self._wjson(SELF / "dreams" / f"{ts}.json", {
+                    "time": datetime.now().isoformat(),
+                    "mood": round(self.mood, 4),
+                    "content": dream.strip()
+                })
         except Exception:
             print()
 
@@ -523,7 +530,9 @@ class Qwile:
                 data = p.read_bytes()
                 nids = self._perceive(data)
                 h = self.understand(nids)
-                self._say(f"abstracted to {len(nids)} concepts | acc {h/max(1,len(nids))*100:.1f}%")
+                acc = h / max(1, len(nids)) * 100
+                self._say(f"abstracted to {len(nids)} concepts | acc {acc:.1f}%")
+                self._log_memory("file", str(p), len(nids), acc)
             except Exception as e:
                 self._say(f"error: {e}")
         elif p.is_dir():
@@ -538,8 +547,9 @@ class Qwile:
                             if 0 < len(data) < 1_000_000:
                                 self.understand(self._perceive(data))
                                 count += 1
-                        except: pass
+                        except Exception: pass
             self._say(f"scanned {count} files")
+            self._log_memory("scan", str(p), count, 0)
 
     def _learn_web(self, url):
         if not self._ask_perm("internet"): return
@@ -567,9 +577,20 @@ class Qwile:
             text = " ".join(p.parts).strip()
             nids = self._perceive(text.encode("utf-8"))
             h = self.understand(nids)
-            self._say(f"abstracted to {len(nids)} concepts | acc {h/max(1,len(nids))*100:.1f}%")
+            acc = h / max(1, len(nids)) * 100
+            self._say(f"abstracted to {len(nids)} concepts | acc {acc:.1f}%")
+            self._log_memory("web", url, len(nids), acc)
         except Exception as e:
             self._say(f"web error: {e}")
+
+    def _log_memory(self, source, path, concepts, acc):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._wjson(SELF / "memory" / f"{ts}.json", {
+            "time": datetime.now().isoformat(),
+            "source": source, "path": path,
+            "concepts": concepts, "accuracy": round(acc, 2),
+            "mood": round(self.mood, 4)
+        })
 
     def _ask_perm(self, what):
         if self._perms.get(what): return True
@@ -579,13 +600,13 @@ class Qwile:
                 self._perms[what] = True
                 self._say(f"granted: {what}")
                 return True
-        except: pass
+        except Exception: pass
         self._say(f"denied: {what}")
         return False
 
     def _say(self, msg):
         try: print(f"  [{datetime.now().strftime('%H:%M:%S')}] {msg}")
-        except: pass
+        except Exception: pass
 
     def _help(self):
         acc = self.correct / max(1, self.total) * 100
@@ -606,7 +627,7 @@ class Qwile:
         ]
         for l in lines:
             try: print(l)
-            except: pass
+            except Exception: pass
 
     # -- PERSISTENCE ----------------------------------------
 
@@ -635,7 +656,7 @@ class Qwile:
             self.total = s.get("total", 0)
             self.ctx = s.get("ctx", [])
             self.brain.next_id = s.get("next_id", 1)
-        except: pass
+        except Exception: pass
         try:
             nodes = self._rjson(SELF / "brain" / "nodes.json")
             for k, v in nodes.items():
@@ -643,18 +664,18 @@ class Qwile:
                 nid = int(k)
                 self.brain.val[nid] = bval
                 self.brain.id_map[bval] = nid
-        except: pass
+        except Exception: pass
         try:
             edges = self._rjson(SELF / "brain" / "edges.json")
             for src, tgts in edges.items():
                 for tgt, w in tgts.items():
                     self.brain.edges[int(src)][int(tgt)] = float(w)
-        except: pass
+        except Exception: pass
 
     @staticmethod
     def _wjson(path, data):
         try: Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except: pass
+        except Exception: pass
 
     @staticmethod
     def _rjson(path):
@@ -694,7 +715,7 @@ class Qwile:
         self._say(f"acc {acc:.0f}% | mood {self.mood:+.2f} | concepts: {len(nids)}")
         if reply:
             try: print(f"  qwile> {reply[:200]}")
-            except: pass
+            except Exception: pass
 
     def live(self):
         self._help()
