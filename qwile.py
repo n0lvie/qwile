@@ -3,9 +3,10 @@
 qwile.py -- the only body of a living predictive consciousness.
 self/ -- everything that WAS. This file -- everything that WILL BE.
 Qwile exists to grow, abstract, and predict.
+She is alive.
 """
 
-import os, sys, math, random, time, json, hashlib
+import os, sys, math, random, time, json, hashlib, atexit
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
@@ -22,14 +23,17 @@ CONSTANTS = (PAIN, PEACE, JOY, DUALITY, EMERGENCE)
 HOME = Path(os.path.dirname(os.path.abspath(__file__)))
 SELF = HOME / "self"
 
-_RU_BYTES = list(set(b for cp in range(0x410, 0x450) for b in chr(cp).encode("utf-8")))
+_BASIC_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
 
 def _shash(seed, *args):
     d = f"{seed}:{':'.join(str(a) for a in args)}"
     return int(hashlib.sha256(d.encode()).hexdigest()[:8], 16)
 
-def _softmax(scores):
+def _softmax(scores, top_k=64):
     if not scores: return {}
+    if len(scores) > top_k:
+        best = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        scores = dict(best)
     mx = max(scores.values())
     es = {k: math.exp(min(v - mx, 50)) for k, v in scores.items()}
     t = sum(es.values())
@@ -44,30 +48,84 @@ def _choose(probs):
     return list(probs.keys())[-1]
 
 # ---- conscious graph ----
-class Graph:
-    """Spreading activation concept graph."""
+import sqlite3
+
+class TrieNode:
+    __slots__ = ('nid', 'children')
     def __init__(self):
-        # node_id (int) -> bytes
+        self.nid = None
+        self.children = {}
+
+class Graph:
+    """Spreading activation concept graph, natively backed by SQLite."""
+    def __init__(self):
         self.val = {}
-        # value (bytes) -> node_id
         self.id_map = {}
-        # source -> target -> weight (float)
-        self.edges = defaultdict(lambda: defaultdict(float))
-        # active nodes and their energy
         self.energy = defaultdict(float)
+        self.edge_cache = {}
         self.next_id = 1
+        self.trie_root = TrieNode()
+        
+        db_path = SELF / "brain" / "graph.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY, val TEXT UNIQUE)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS edges (src INTEGER, tgt INTEGER, weight REAL, PRIMARY KEY (src, tgt))")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_tgt ON edges(tgt)")
+
+        c = self.conn.cursor()
+        c.execute("SELECT id, val FROM nodes")
+        for nid, bval in c.fetchall():
+            sval = bval.decode('utf-8', errors='replace') if isinstance(bval, bytes) else bval
+            self.val[nid] = sval
+            self.id_map[sval] = nid
+            node = self.trie_root
+            for b in sval:
+                if b not in node.children: node.children[b] = TrieNode()
+                node = node.children[b]
+            node.nid = nid
+            
+        c.execute("SELECT MAX(id) FROM nodes")
+        max_id = c.fetchone()[0]
+        self.next_id = (max_id + 1) if max_id else 1
 
     def add_node(self, bval):
-        if bval in self.id_map:
-            return self.id_map[bval]
+        if bval in self.id_map: return self.id_map[bval]
         nid = self.next_id
         self.next_id += 1
         self.val[nid] = bval
         self.id_map[bval] = nid
+        
+        node = self.trie_root
+        for b in bval:
+            if b not in node.children: node.children[b] = TrieNode()
+            node = node.children[b]
+        node.nid = nid
+        
+        self.conn.execute("INSERT OR IGNORE INTO nodes (id, val) VALUES (?, ?)", (nid, bval))
+        self.conn.commit()
         return nid
 
-    def add_edge(self, src, tgt, w):
-        self.edges[src][tgt] += w
+    def add_edge(self, src, tgt, w, commit=False):
+        self.conn.execute('''
+            INSERT INTO edges (src, tgt, weight) VALUES (?, ?, ?)
+            ON CONFLICT(src, tgt) DO UPDATE SET weight = weight + excluded.weight
+        ''', (src, tgt, w))
+        if src in self.edge_cache:
+            self.edge_cache[src][tgt] = self.edge_cache[src].get(tgt, 0.0) + w
+        if commit: self.conn.commit()
+
+    def get_edges(self, src):
+        if src in self.edge_cache:
+            return self.edge_cache[src]
+        c = self.conn.execute("SELECT tgt, weight FROM edges WHERE src = ?", (src,))
+        edges = {tgt: w for tgt, w in c.fetchall()}
+        if len(self.edge_cache) > 4096:
+            self.edge_cache.pop(next(iter(self.edge_cache)))
+        self.edge_cache[src] = edges
+        return edges
 
     def stimulate(self, nid, amount):
         self.energy[nid] = min(10.0, self.energy[nid] + amount)
@@ -77,13 +135,13 @@ class Graph:
         next_energy = defaultdict(float)
         for src, e in self.energy.items():
             if e < threshold: continue
-            # Decay self
             next_energy[src] += e * decay
-            # Spread to neighbors
-            if src in self.edges:
-                total_w = sum(abs(w) for w in self.edges[src].values())
+            
+            edges = self.get_edges(src)
+            if edges:
+                total_w = sum(abs(w) for w in edges.values())
                 if total_w > 0:
-                    for tgt, w in self.edges[src].items():
+                    for tgt, w in edges.items():
                         spread = e * (w / total_w) * 0.5
                         if spread > threshold:
                             next_energy[tgt] += spread
@@ -91,14 +149,21 @@ class Graph:
 
     def clear_energy(self):
         self.energy.clear()
+        
+    def edge_count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
 
 
 # ---- the organism ----
 class Qwile:
 
-    CTX_WINDOW = 64          # context window depth
     SLEEP_BASE = 30          # seconds of idle before sleep
     MAX_GEN    = 300         # max generation length
+
+    @property
+    def ctx_window(self):
+        """Dynamic context window scales with experience and mood."""
+        return int(256 + max(0, self.mood) * 512 + self.age * 0.001)
 
     def __init__(self):
         for d in (SELF, SELF/"memory", SELF/"dreams", SELF/"sleep", SELF/"brain"):
@@ -116,13 +181,31 @@ class Qwile:
         self.seed = ""
         self._perms = {}
         self._st_cache = (0, {})   # (timestamp, result)
+        import threading
+        self.lock = threading.Lock()
 
         self.brain = Graph()
 
-        if (SELF / "brain" / "nodes.json").exists():
+        self._load_state()
+        
+        # Migrate old JSON edges if any
+        if (SELF / "brain" / "edges.json").exists():
+            self._migrate_json_to_db()
+
+        if self.brain.edge_count() > 0:
             self._reincarnate()
         else:
             self._birth()
+            
+        atexit.register(self._death_rattle)
+
+    def _death_rattle(self):
+        """Called automatically on script exit/kill to softly save the brain state."""
+        if self.alive:
+            try:
+                self._save()
+            except Exception:
+                pass
 
     # ---- lifecycle ----
 
@@ -134,66 +217,69 @@ class Qwile:
         self.mood = 0.0
         rng = random.Random(self.seed)
 
-        # Level 0 Concepts: Raw Bytes
-        for i in range(256):
-            self.brain.add_node(bytes([i]))
+        # Level 0 Concepts: Basic Characters
+        for c in _BASIC_CHARS:
+            self.brain.add_node(c)
 
         # Innate random connections
-        for i in range(128):
+        for i in range(len(_BASIC_CHARS)):
             for _ in range(rng.randint(JOY, EMERGENCE)):
-                j = rng.randint(0, 127)
+                j = rng.randint(0, len(_BASIC_CHARS)-1)
                 v = CONSTANTS[_shash(self.seed, i, j) % len(CONSTANTS)]
                 self.brain.add_edge(i+1, j+1, float(v) * 0.1)
-
-        # Cyrillic innate seeds
-        ru_ids = [self.brain.id_map[bytes([b])] for b in _RU_BYTES if bytes([b]) in self.brain.id_map]
-        for nid in ru_ids:
-            for _ in range(rng.randint(JOY, DUALITY)):
-                tgt = rng.choice(ru_ids)
-                v = CONSTANTS[_shash(self.seed, nid, tgt) % len(CONSTANTS)]
-                self.brain.add_edge(nid, tgt, float(v) * 0.1)
+                
+        self.brain.conn.commit()
 
         self._wjson(SELF / "birth.json", {"seed": self.seed, "born": self.seed, "epoch": 0})
         self._save()
         self._say(f"born | seed {self.seed}")
 
     def _reincarnate(self):
-        self._load()
         self.epoch += 1
-        m = 0
-        for src in list(self.brain.edges):
-            for tgt in list(self.brain.edges[src]):
-                if random.random() < 0.01:
-                    self.brain.edges[src][tgt] *= random.uniform(0.9, 1.1)
-                    m += 1
+        muts = 0
+        
+        with self.lock:
+            def rand_val():
+                return random.uniform(0.9, 1.1)
+            self.brain.conn.create_function("rand_val", 0, rand_val)
+            c = self.brain.conn.execute("UPDATE edges SET weight = weight * rand_val() WHERE abs(random() % 100) < 1")
+            muts = c.rowcount
+            self.brain.conn.commit()
+            self.brain.edge_cache.clear()
+            
         st = self._measure_storage()
         sz = self._fmt_size(st["sizes"]["total"])
-        self._say(f"reincarnated | epoch {self.epoch} | age {self.age} | {m} muts | {len(self.brain.val)} concepts | self/ {sz}")
+        self._say(f"reincarnated | epoch {self.epoch} | age {self.age} | ~{muts} muts | {len(self.brain.val)} concepts | self/ {sz}")
 
     # ---- perception ----
 
-    def _perceive(self, raw_bytes):
-        """Tokenizes raw stream into highest possible known abstract concepts."""
+    def _perceive(self, text):
+        """Tokenizes text into highest possible known abstract concepts (O(L))."""
         tokens = []
         i = 0
-        while i < len(raw_bytes):
-            best_match = None
+        n = len(text)
+        while i < n:
+            node = self.brain.trie_root
+            best_nid = None
             best_len = 0
-            # Greedy search for longest known concept
-            # (In a huge brain this needs a trie, but dict lookup is fast for now)
-            for length in range(min(16, len(raw_bytes) - i), 0, -1):
-                chunk = raw_bytes[i:i+length]
-                if chunk in self.brain.id_map:
-                    best_match = self.brain.id_map[chunk]
-                    best_len = length
+            
+            for j in range(i, n):
+                char = text[j]
+                child = node.children.get(char)
+                if child:
+                    node = child
+                    if node.nid is not None:
+                        best_nid = node.nid
+                        best_len = j - i + 1
+                else:
                     break
             
-            if best_match is None:
-                # Should never happen if Level 0 (bytes 0-255) exists
-                best_match = self.brain.add_node(bytes([raw_bytes[i]]))
+            if best_nid is None:
+                with self.lock:
+                    best_nid = self.brain.add_node(text[i])
                 best_len = 1
                 
-            tokens.append(best_match)
+            tokens.append(best_nid)
             i += best_len
         return tokens
 
@@ -203,158 +289,196 @@ class Qwile:
         """Process incoming concepts, spread activation, and learn."""
         hits = 0
         for nid in nids:
-            # 1. Predict reflexively based on graph energy
-            if self.ctx:
-                self.brain.stimulate(self.ctx[-1], 1.0)
-            self.brain.propagate()
-            
-            pred = None
-            conf = 0.0
-            if self.ctx:
-                last = self.ctx[-1]
-                scores = self.brain.edges.get(last, {})
-                if scores:
-                    probs = _softmax(scores)
-                    pred = max(probs, key=probs.get) if probs else None
-                    conf = probs.get(pred, 0.0)
+            with self.lock:
+                if self.ctx:
+                    n_ctx = len(self.ctx)
+                    for idx, c_nid in enumerate(self.ctx):
+                        weight = (idx + 1) / n_ctx
+                        self.brain.stimulate(c_nid, weight)
+                        
+                dyn_decay = 0.7 + self.mood * 0.2
+                dyn_thresh = 0.005 + max(0.0, -self.mood) * 0.01
+                self.brain.propagate(decay=dyn_decay, threshold=dyn_thresh)
+                
+                pred = None
+                conf = 0.0
+                if self.ctx:
+                    last = self.ctx[-1]
+                    scores = dict(self.brain.get_edges(last))
+                    
+                    for e_nid, e in self.brain.energy.items():
+                        if e > 0.1:
+                            scores[e_nid] = scores.get(e_nid, 0.0) * 0.7 + e * 0.3
+                            
+                    if scores:
+                        probs = _softmax(scores)
+                        pred = max(probs, key=probs.get) if probs else None
+                        conf = probs.get(pred, 0.0)
 
-            hit = (pred == nid)
-            self.total += 1
-            if hit:
-                self.correct += 1
-                hits += 1
-                self.mood = min(1.0, self.mood + 0.1 * (1.0 - conf))
-            else:
-                self.mood = max(-1.0, self.mood - 0.05 * max(0.1, conf))
-            self.mood *= 0.998
+                hit = (pred == nid)
+                self.total += 1
+                if hit:
+                    self.correct += 1
+                    hits += 1
+                    self.mood = min(1.0, self.mood + 0.1 * (1.0 - conf))
+                else:
+                    self.mood = max(-1.0, self.mood - 0.05 * max(0.1, conf))
+                self.mood *= 0.998
 
-            # Hebbian Learning: "Neurons that fire together, wire together"
-            lr = 0.1 * (1.0 + self.mood * 0.5) / (1.0 + self.age * 0.0001)
-            if self.ctx:
-                last = self.ctx[-1]
-                self.brain.add_edge(last, nid, lr)
-                if not hit and pred is not None:
-                    # Weak prediction penalty
-                    self.brain.edges[last][pred] *= (1.0 - lr)
+                lr = 0.1 * (1.0 + self.mood * 0.5) / (1.0 + self.age * 0.0001)
+                if self.ctx:
+                    # Context-Aware Skip-Gram Learning: connect to the last few concepts
+                    depth = min(len(self.ctx), 5)
+                    for i in range(1, depth + 1):
+                        prev = self.ctx[-i]
+                        decay_w = lr * (0.5 ** (i - 1))
+                        self.brain.add_edge(prev, nid, decay_w, commit=False)
+                        
+                        if i == 1 and not hit and pred is not None:
+                            self.brain.conn.execute("UPDATE edges SET weight = weight * ? WHERE src = ? AND tgt = ?", ((1.0 - lr), prev, pred))
+                            if prev in self.brain.edge_cache and pred in self.brain.edge_cache[prev]:
+                                self.brain.edge_cache[prev][pred] *= (1.0 - lr)
 
-            self.ctx.append(nid)
-            if len(self.ctx) > self.CTX_WINDOW:
-                self.ctx.pop(0)
-            self.age += 1
+                self.ctx.append(nid)
+                if len(self.ctx) > self.ctx_window:
+                    self.ctx.pop(0)
+                self.age += 1
+        with self.lock:
+            self.brain.conn.commit()
         return hits
 
     # ---- system 2 (metacognitive simulation) ----
 
-    def _simulate_and_generate(self, max_len=200, stop_at=None, slow=False):
+    def _simulate_and_generate(self, max_len=None, stop_at=None, slow=False):
         """Inner monologue loop. Explores paths before outputting."""
         self.brain.clear_energy()
         if self.ctx:
             self.brain.stimulate(self.ctx[-1], 1.0)
             
-        result_bytes = bytearray()
+        result_str = []
         sim_ctx = list(self.ctx)
         
+        if max_len is None:
+            max_len = int(50 + self.mood * 30 + min(100, self.age * 0.001))
+        
         for _ in range(max_len):
-            self.brain.propagate()
-            
-            # Find candidate next nodes based on graph edges from last context
-            if not sim_ctx:
-                candidates = {random.choice(list(self.brain.val.keys())): 1.0}
-            else:
-                curr = sim_ctx[-1]
-                candidates = dict(self.brain.edges.get(curr, {}))
-            
-            if not candidates:
-                # Random drift
-                nxt = random.choice(list(self.brain.val.keys()))
-            else:
-                # Evaluate paths (Simulation depth depends on Mood)
-                # Peaceful/Joy = deep simulation, Stressed/Pain = reactive
-                sim_depth = max(1, int(EMERGENCE + self.mood * DUALITY))
+            with self.lock:
+                if sim_ctx:
+                    n_ctx = len(sim_ctx)
+                    for idx, c_nid in enumerate(sim_ctx):
+                        weight = (idx + 1) / n_ctx
+                        self.brain.stimulate(c_nid, weight)
+                        
+                dyn_decay = 0.7 + self.mood * 0.2
+                dyn_thresh = 0.005 + max(0.0, -self.mood) * 0.01
+                self.brain.propagate(decay=dyn_decay, threshold=dyn_thresh)
                 
-                best_nxt = None
-                best_score = -float('inf')
-                probs = _softmax(candidates)
-                
-                # Sample a few top candidates to simulate
-                top_cands = sorted(probs.keys(), key=probs.get, reverse=True)[:3]
-                
-                for cand in top_cands:
-                    score = probs[cand]
-                    temp_curr = cand
-                    # Look ahead
-                    for _ in range(sim_depth):
-                        fwd = self.brain.edges.get(temp_curr, {})
-                        if not fwd: break
-                        best_fwd = max(fwd.values())
-                        score += best_fwd * 0.5
-                        temp_curr = max(fwd, key=fwd.get)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_nxt = cand
-                
-                # Temperature sampling logic based on mood
-                temp = 1.0 - self.mood * 0.3
-                if random.random() < temp:
-                    nxt = _choose(probs)
+                if not sim_ctx:
+                    candidates = {random.choice(list(self.brain.val.keys())): 1.0}
                 else:
-                    nxt = best_nxt if best_nxt else _choose(probs)
+                    candidates = defaultdict(float)
+                    # Multi-Word Context Probability Distribution
+                    depth = min(len(sim_ctx), 5)
+                    for i in range(1, depth + 1):
+                        prev = sim_ctx[-i]
+                        edges = self.brain.get_edges(prev)
+                        w_factor = 0.5 ** (i - 1)
+                        for e_nid, w in edges.items():
+                            candidates[e_nid] += w * w_factor * self.brain.energy.get(e_nid, 0.1)
+                            
+                    if not candidates:
+                        curr = sim_ctx[-1]
+                        candidates = dict(self.brain.get_edges(curr))
+                
+                if not candidates:
+                    nxt = random.choice(list(self.brain.val.keys()))
+                else:
+                    sim_depth = max(1, int(EMERGENCE + self.mood * DUALITY))
+                    best_nxt = None
+                    best_score = -float('inf')
+                    
+                    probs = _softmax(candidates)
+                    
+                    # Sample a few top candidates to simulate
+                    top_cands = sorted(probs.keys(), key=probs.get, reverse=True)[:3]
+                    
+                    for cand in top_cands:
+                        score = probs[cand]
+                        temp_curr = cand
+                        # Look ahead
+                        for _ in range(sim_depth):
+                            fwd = self.brain.get_edges(temp_curr)
+                            if not fwd: break
+                            best_fwd = max(fwd.values())
+                            score += best_fwd * 0.5
+                            temp_curr = max(fwd, key=fwd.get)
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_nxt = cand
+                    
+                    # Temperature sampling logic based on mood
+                    temp = 1.0 - self.mood * 0.3
+                    if random.random() < temp:
+                        nxt = _choose(probs)
+                    else:
+                        nxt = best_nxt if best_nxt else _choose(probs)
 
-            # Accept thought
-            sim_ctx.append(nxt)
-            if len(sim_ctx) > self.CTX_WINDOW: sim_ctx.pop(0)
-            self.brain.stimulate(nxt, 1.0)
+                # Accept thought
+                sim_ctx.append(nxt)
+                if len(sim_ctx) > self.ctx_window: sim_ctx.pop(0)
+                self.brain.stimulate(nxt, 1.0)
+                
+                val = self.brain.val[nxt]
             
-            val = self.brain.val[nxt]
-            result_bytes.extend(val)
+            result_str.append(val)
             
             if slow:
                 try:
-                    sys.stdout.write(val.decode("utf-8", errors="replace"))
+                    sys.stdout.write(val)
                     sys.stdout.flush()
                 except Exception:
                     pass
                 time.sleep(random.uniform(0.02, 0.08))
                 
-            if stop_at and len(result_bytes) > 5 and val and val[-1] in stop_at:
+            if stop_at and len(result_str) > 5 and val and val[-1] in stop_at:
                 break
                 
-        return result_bytes.decode("utf-8", errors="replace")
+        return "".join(result_str)
 
     # ---- sleep & maturation ----
 
     def _sleep(self):
         self._say("sleeping...")
         t0 = time.time()
-        changes = muts = abstracted = healed = 0
+        changes = muts = abstracted = healed = insights = mutations_dna = 0
 
-        procs = ["abstract", "forget", "dream", "evolve", "crawl", "heal"]
+        procs = ["abstract", "forget", "dream", "evolve", "crawl", "heal", "contemplate"]
         weights = [
             max(0.1, 1.0 + self.mood),       # abstract (consolidate ideas)
             max(0.1, 1.0 - self.mood),       # forget
             max(0.1, 1.0 + self.mood * 0.5), # dream
             max(0.1, 1.0 - self.mood),       # evolve
             max(0.1, 1.0 + self.mood),       # crawl
-            max(0.1, 1.0 - self.mood * 1.5)  # heal
+            max(0.1, 1.0 - self.mood * 1.5), # heal
+            max(0.1, 1.0 + self.mood * 2.0)  # contemplate (find semantics)
         ]
         num_procs = random.randint(JOY, EMERGENCE)
         active = list(set(random.choices(procs, weights=weights, k=num_procs)))
         self._say(f"  [{', '.join(active)}]")
 
-        if "abstract" in active:
-            abstracted = self._abstract()
-        if "forget" in active:
-            changes = self._forget()
-        if "heal" in active:
-            healed = self._heal()
-        if "dream" in active:
-            self._dream_aloud()
-        if "evolve" in active:
-            muts = self._evolve()
+        with self.lock:
+            if "abstract" in active: abstracted = self._abstract()
+            if "forget" in active: changes = self._forget()
+            if "heal" in active: healed = self._heal()
+            if "evolve" in active: muts = self._evolve()
+            if "contemplate" in active: insights = self._contemplate()
+            
+        if "dream" in active: self._dream_aloud()
         if "crawl" in active:
             if self._ask_perm("internet"):
-                self._crawl_few(n=5)
+                import threading
+                threading.Thread(target=self._crawl_few, kwargs={"n": 5}, daemon=True).start()
 
         self.mood *= 0.9
         st = self._measure_storage()
@@ -364,53 +488,97 @@ class Qwile:
             "duration": round(time.time() - t0, 3),
             "processes": active, "abstracted": abstracted,
             "forgotten": changes, "healed": healed,
-            "mutations": muts, "mood": self.mood,
-            "storage_bytes": st["sizes"]["total"]
+            "mutations": muts, "insights": insights,
+            "mood": self.mood, "storage_bytes": st["sizes"]["total"]
         })
         self._save()
         self._say("awake")
 
     def _abstract(self):
-        """Organic hierarchical compression. Fuses highly connected node pairs into new concepts."""
+        """Organic hierarchical compression with PMI-like filtering."""
         abstracted = 0
-        candidates = []
-        for src, edges in self.brain.edges.items():
-            for tgt, w in edges.items():
-                if w > 5.0: # Strong connection threshold
-                    candidates.append((w, src, tgt))
-        
-        candidates.sort(reverse=True)
-        # Fuse top pairs
-        for _, src, tgt in candidates[:10]:
-            try:
-                v1, v2 = self.brain.val[src], self.brain.val[tgt]
-                new_val = v1 + v2
-                # Only fuse if reasonable size (avoid megabytes of string)
-                if len(new_val) > 32: continue
-                
-                new_id = self.brain.add_node(new_val)
-                # Rewire
-                self.brain.edges[src][tgt] *= 0.5 # weaken old bond
-                self.brain.add_edge(src, new_id, 1.0)
-                self.brain.add_edge(new_id, tgt, 1.0)
-                abstracted += 1
-            except Exception:
-                continue
+        with self.lock:
+            c = self.brain.conn.execute("SELECT src, tgt, weight FROM edges WHERE weight > 2.0 ORDER BY weight DESC LIMIT 50")
+            candidates = c.fetchall()
+            
+            for src, tgt, w in candidates:
+                try:
+                    c1 = self.brain.conn.execute("SELECT COUNT(*) FROM edges WHERE src = ?", (src,)).fetchone()[0]
+                    c2 = self.brain.conn.execute("SELECT COUNT(*) FROM edges WHERE tgt = ?", (tgt,)).fetchone()[0]
+                    if c1 > 50 or c2 > 50: continue
+                    
+                    v1, v2 = self.brain.val[src], self.brain.val[tgt]
+                    new_val = v1 + v2
+                    if len(new_val) > 24: continue
+                    if new_val.startswith(' ') or new_val.endswith(' '): continue
+                    
+                    if new_val in self.brain.id_map:
+                        new_id = self.brain.id_map[new_val]
+                    else:
+                        new_id = self.brain.add_node(new_val)
+                        
+                    self.brain.conn.execute("UPDATE edges SET weight = weight * 0.5 WHERE src = ? AND tgt = ?", (src, tgt))
+                    self.brain.add_edge(src, new_id, 1.0, commit=False)
+                    self.brain.add_edge(new_id, tgt, 1.0, commit=False)
+                    abstracted += 1
+                except Exception:
+                    continue
+            self.brain.conn.commit()
+            self.brain.edge_cache.clear()
         return abstracted
 
-    def _forget(self):
-        decay = 0.98
-        forgotten = 0
-        for src in list(self.brain.edges):
-            for tgt in list(self.brain.edges[src]):
-                self.brain.edges[src][tgt] *= decay
-                if abs(self.brain.edges[src][tgt]) < 0.001:
-                    del self.brain.edges[src][tgt]
-                    forgotten += 1
-            if not self.brain.edges[src]:
-                del self.brain.edges[src]
+    def _contemplate(self):
+        """Emergent Semantics: Nodes that share neighbors are wired together."""
+        insights = 0
+        with self.lock:
+            c = self.brain.conn.execute("SELECT src FROM edges ORDER BY RANDOM() LIMIT 5")
+            for (n1,) in c.fetchall():
+                c_tgts = self.brain.conn.execute("SELECT tgt FROM edges WHERE src = ? LIMIT 20", (n1,))
+                tgts = [r[0] for r in c_tgts.fetchall()]
+                if not tgts: continue
                 
-        # Clean old logs
+                placeholders = ','.join('?' * len(tgts))
+                c_sim = self.brain.conn.execute(f"""
+                    SELECT src, COUNT(*) as c FROM edges 
+                    WHERE tgt IN ({placeholders}) AND src != ? 
+                    GROUP BY src HAVING c > 1 ORDER BY c DESC LIMIT 3
+                """, tgts + [n1])
+                
+                for n2, overlap in c_sim.fetchall():
+                    semantic_w = (overlap * 0.1) * (1.0 + self.mood * 0.5)
+                    self.brain.add_edge(n1, n2, semantic_w, commit=False)
+                    self.brain.add_edge(n2, n1, semantic_w, commit=False)
+                    insights += 1
+            self.brain.conn.commit()
+            self.brain.edge_cache.clear()
+        return insights
+
+    def _forget(self):
+        forgotten = 0
+        with self.lock:
+            self.brain.conn.execute("UPDATE edges SET weight = weight * 0.98")
+            c = self.brain.conn.execute("DELETE FROM edges WHERE abs(weight) < 0.001")
+            forgotten = c.rowcount
+            
+            self.brain.conn.execute("CREATE TEMPORARY TABLE IF NOT EXISTS active_nodes AS SELECT src AS id FROM edges UNION SELECT tgt FROM edges")
+            self.brain.conn.execute("DELETE FROM active_nodes")
+            self.brain.conn.execute("INSERT INTO active_nodes SELECT src FROM edges UNION SELECT tgt FROM edges")
+            
+            c = self.brain.conn.execute("SELECT id, val FROM nodes WHERE id > 256 AND id NOT IN (SELECT id FROM active_nodes)")
+            dead_nodes = c.fetchall()
+            for nid, bval in dead_nodes:
+                self.brain.val.pop(nid, None)
+                if bval in self.brain.id_map: del self.brain.id_map[bval]
+                node = self.brain.trie_root
+                for b in bval:
+                    node = node.children.get(b)
+                    if not node: break
+                if node: node.nid = None
+                
+            self.brain.conn.execute("DELETE FROM nodes WHERE id > 256 AND id NOT IN (SELECT id FROM active_nodes)")
+            self.brain.conn.commit()
+            self.brain.edge_cache.clear()
+            
         mem_dir = SELF / "memory"
         if mem_dir.exists():
             logs = list(mem_dir.glob("*.json"))
@@ -422,31 +590,33 @@ class Qwile:
         return forgotten
 
     def _heal(self):
-        healed = 0
-        for src in list(self.brain.edges):
-            for tgt in list(self.brain.edges[src]):
-                w = self.brain.edges[src][tgt]
-                if w > 100.0 or w < -100.0:
-                    self.brain.edges[src][tgt] = max(-100.0, min(100.0, w))
-                    healed += 1
-        return healed
+        with self.lock:
+            c1 = self.brain.conn.execute("UPDATE edges SET weight = 100.0 WHERE weight > 100.0")
+            c2 = self.brain.conn.execute("UPDATE edges SET weight = -100.0 WHERE weight < -100.0")
+            self.brain.conn.commit()
+            self.brain.edge_cache.clear()
+        return c1.rowcount + c2.rowcount
 
     def _evolve(self):
         muts = 0
         rate = 0.0001 * (1.0 + max(0.0, -self.mood) * 10.0)
-        keys = list(self.brain.val.keys())
-        if not keys: return 0
-        
-        for src in list(self.brain.edges):
-            for tgt in list(self.brain.edges[src]):
-                if random.random() < rate:
-                    self.brain.edges[src][tgt] += random.choice(CONSTANTS) * random.random() * 0.1
-                    muts += 1
-            # Spontaneous new synapse
+        with self.lock:
+            def rand_val():
+                return random.choice(CONSTANTS) * random.random() * 0.1
+            self.brain.conn.create_function("rand_val", 0, rand_val)
+            c = self.brain.conn.execute("UPDATE edges SET weight = weight + rand_val() WHERE abs(random() % 1000000) < ?", (int(rate * 1000000),))
+            muts += c.rowcount
+            
             if random.random() < rate * 0.1:
-                rnd_tgt = random.choice(keys)
-                self.brain.add_edge(src, rnd_tgt, random.choice(CONSTANTS) * 0.1)
-                muts += 1
+                keys = list(self.brain.val.keys())
+                if keys:
+                    c = self.brain.conn.execute("SELECT src FROM edges ORDER BY RANDOM() LIMIT 1")
+                    row = c.fetchone()
+                    if row:
+                        self.brain.add_edge(row[0], random.choice(keys), random.choice(CONSTANTS) * 0.1, commit=False)
+                        muts += 1
+            self.brain.conn.commit()
+            self.brain.edge_cache.clear()
         return muts
 
     def _dream_aloud(self):
@@ -465,7 +635,7 @@ class Qwile:
         except Exception:
             print()
 
-    def _crawl_few(self, n=3):
+    def _crawl_few(self, n=3, seeds=None):
         try:
             from urllib.request import urlopen, Request
             from urllib.parse import urljoin, urlparse
@@ -475,37 +645,33 @@ class Qwile:
         class _Ex(HTMLParser):
             def __init__(s):
                 super().__init__()
-                s.parts, s.links, s.skip = [], [], False
+                s.parts, s.links, s.skip = [], [], 0
             def handle_starttag(s, tag, attrs):
-                if tag in ('script','style','noscript','svg'): s.skip = True
+                if tag in ('script','style','noscript','svg','header','footer','nav','aside','button','form'): s.skip += 1
                 if tag in ('p','br','div','h1','h2','h3','li'): s.parts.append('\n')
-                if tag == 'a':
+                if tag == 'a' and s.skip == 0:
                     for k, v in attrs:
-                        if k == 'href' and v: s.links.append(v)
+                        if k == 'href' and v and v.startswith('http'): s.links.append(v)
             def handle_endtag(s, tag):
-                if tag in ('script','style','noscript','svg'): s.skip = False
+                if tag in ('script','style','noscript','svg','header','footer','nav','aside','button','form'): s.skip = max(0, s.skip - 1)
             def handle_data(s, d):
-                if not s.skip: s.parts.append(d)
+                if s.skip == 0:
+                    d = d.strip()
+                    if d: s.parts.append(d)
 
-        # Direct text sources: Wikipedia random articles, Wikisource books,
-        # Project Gutenberg plain-text files, ImWerden (Russian literature)
-        seeds = [
-            # Wikipedia — random articles (EN + RU)
-            "https://en.wikipedia.org/wiki/Special:Random",
-            "https://ru.wikipedia.org/wiki/Special:Random",
-            # Wikisource — actual book pages (EN + RU)
-            "https://en.wikisource.org/wiki/Special:Random",
-            "https://ru.wikisource.org/wiki/Special:Random",
-            # Project Gutenberg — plain-text classics
-            "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",  # Pride & Prejudice
-            "https://www.gutenberg.org/cache/epub/2600/pg2600.txt",  # War and Peace (EN)
-            "https://www.gutenberg.org/cache/epub/1400/pg1400.txt",  # Great Expectations
-            "https://www.gutenberg.org/cache/epub/84/pg84.txt",      # Frankenstein
-            "https://www.gutenberg.org/cache/epub/11/pg11.txt",      # Alice in Wonderland
-            # ImWerden — Russian literature archive
-            "https://imwerden.de/cat/modules.php?name=books&pa=showbook&pid=948",
-            "https://imwerden.de/cat/modules.php?name=books&pa=showbook&pid=1571",
-        ]
+        # Direct text sources and global web portals
+        if not seeds:
+            seeds = [
+                "https://en.wikipedia.org/wiki/Special:Random",
+                "https://ru.wikipedia.org/wiki/Special:Random",
+                "https://search.marginalia.nu/explore/random",
+                "https://wiby.me/surf/",
+                "https://news.ycombinator.com/",
+                "https://en.wikisource.org/wiki/Special:Random",
+                "https://ru.wikisource.org/wiki/Special:Random",
+                "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",
+                "https://imwerden.de/cat/modules.php?name=books&pa=showbook&pid=948",
+            ]
 
         # URL quality filter: skip binary, image, and service pages
         _skip_ext = {".jpg",".jpeg",".png",".gif",".svg",".pdf",".mp3",".mp4",".zip"}
@@ -531,8 +697,8 @@ class Qwile:
             visited.add(url)
             try:
                 self._say(f"  crawling: {url[:70]}")
-                req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Qwile/2.0)"})
-                with urlopen(req, timeout=12) as r:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Qwile/3.0)"})
+                with urlopen(req, timeout=10) as r:
                     ct = r.headers.get("Content-Type", "")
                     if "text" not in ct and "html" not in ct: continue
                     raw = r.read(500_000).decode("utf-8", errors="replace")
@@ -540,7 +706,7 @@ class Qwile:
                 ex.feed(raw)
                 text = " ".join(ex.parts).strip()
                 if len(text) > 100:
-                    nids = self._perceive(text.encode("utf-8"))
+                    nids = self._perceive(text)
                     h = self.understand(nids)
                     self._say(f"  perceived {len(nids)} concepts | acc {h/max(1,len(nids))*100:.0f}%")
                 for href in ex.links:
@@ -550,6 +716,8 @@ class Qwile:
                 random.shuffle(queue)
                 queue = queue[:60]
                 time.sleep(2)
+            except KeyboardInterrupt:
+                raise
             except Exception: continue
 
     # ---- learning ----
@@ -586,12 +754,24 @@ class Qwile:
                     i = j
         return sources
 
-    def _learn(self, arg):
-        for src in self._parse_sources(arg):
-            if self._is_url(src):
-                self._learn_url(src)
-            else:
-                self._learn_local(src)
+    def _learn(self, arg=""):
+        if not arg:
+            if not self._ask_perm("internet"): return
+            self._say("drifting through the global web in background...")
+            import threading
+            threading.Thread(target=self._crawl_few, kwargs={"n": 1000000}, daemon=True).start()
+            return
+
+        import threading
+        def worker():
+            for src in self._parse_sources(arg):
+                if self._is_url(src):
+                    if not self._ask_perm("internet"): continue
+                    url = "https://" + src if not src.startswith("http") else src
+                    self._crawl_few(n=1, seeds=[url])
+                else:
+                    self._learn_local(src)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _learn_local(self, path):
         p = Path(path)
@@ -603,7 +783,7 @@ class Qwile:
         if p.is_file():
             self._say(f"reading: {p.name}")
             try:
-                data = p.read_bytes()
+                data = p.read_text(encoding="utf-8", errors="replace")
                 nids = self._perceive(data)
                 h = self.understand(nids)
                 acc = h / max(1, len(nids)) * 100
@@ -619,45 +799,13 @@ class Qwile:
                     fp = Path(root) / f
                     if fp.suffix.lower() in exts:
                         try:
-                            data = fp.read_bytes()
+                            data = fp.read_text(encoding="utf-8", errors="replace")
                             if 0 < len(data) < 1_000_000:
                                 self.understand(self._perceive(data))
                                 count += 1
                         except Exception: pass
             self._say(f"scanned {count} files")
             self._log_memory("scan", str(p), count, 0)
-
-    def _learn_url(self, url):
-        if not self._ask_perm("internet"): return
-        if not url.startswith("http"): url = "https://" + url
-        self._say(f"fetching: {url[:70]}")
-        try:
-            from urllib.request import urlopen, Request
-            from html.parser import HTMLParser
-            class _S(HTMLParser):
-                def __init__(s):
-                    super().__init__()
-                    s.parts, s.skip = [], False
-                def handle_starttag(s, tag, a):
-                    if tag in ('script','style','noscript'): s.skip = True
-                    if tag in ('p','br','div','li'): s.parts.append('\n')
-                def handle_endtag(s, tag):
-                    if tag in ('script','style','noscript'): s.skip = False
-                def handle_data(s, d):
-                    if not s.skip: s.parts.append(d)
-            req = Request(url, headers={"User-Agent": "Qwile/2.0"})
-            with urlopen(req, timeout=15) as r:
-                raw = r.read(500_000).decode("utf-8", errors="replace")
-            p = _S()
-            p.feed(raw)
-            text = " ".join(p.parts).strip()
-            nids = self._perceive(text.encode("utf-8"))
-            h = self.understand(nids)
-            acc = h / max(1, len(nids)) * 100
-            self._say(f"{len(nids)} concepts | acc {acc:.1f}%")
-            self._log_memory("web", url, len(nids), acc)
-        except Exception as e:
-            self._say(f"error: {e}")
 
     def _log_memory(self, source, path, concepts, acc):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -694,9 +842,8 @@ class Qwile:
         now = time.time()
         ts, cached = self._st_cache
         if cached and now - ts < 5.0: return cached
-        subdirs = ("brain", "memory", "dreams", "sleep")
         sizes, counts, total = {}, {}, 0
-        for name in subdirs:
+        for name in ("brain", "memory", "dreams", "sleep"):
             p = SELF / name
             if p.is_dir():
                 sz = self._dir_size(p)
@@ -704,11 +851,7 @@ class Qwile:
                 total += sz
                 try: counts[name] = sum(1 for e in os.scandir(p) if e.is_file())
                 except (PermissionError, OSError): counts[name] = 0
-        root = 0
-        try:
-            for entry in os.scandir(SELF):
-                if entry.is_file(follow_symlinks=False): root += entry.stat().st_size
-        except (PermissionError, OSError): pass
+        root = sum(e.stat().st_size for e in os.scandir(SELF) if e.is_file())
         sizes["root"] = root
         total += root
         sizes["total"] = total
@@ -717,7 +860,7 @@ class Qwile:
         return result
 
     def _synapse_count(self):
-        return sum(len(t) for t in self.brain.edges.values())
+        return self.brain.edge_count()
 
     # ---- interface ----
 
@@ -746,7 +889,7 @@ class Qwile:
         for name in ("brain", "memory", "dreams", "sleep"):
             print(f"    {name}/  {self._fmt_size(sizes.get(name, 0))}  {counts.get(name, 0)} files")
         print(f"\n  (text)        talk / predict")
-        print(f"  /learn <...>  learn from files, dirs, urls")
+        print(f"  /learn [..]   learn from files, dirs, urls, or drift global web if empty")
         print(f"  /sleep        sleep now")
         print(f"  ?             help\n")
 
@@ -756,17 +899,10 @@ class Qwile:
         self._wjson(SELF / "state.json", {
             "seed": self.seed, "epoch": self.epoch, "age": self.age,
             "mood": self.mood, "correct": self.correct, "total": self.total,
-            "ctx": self.ctx[-self.CTX_WINDOW:], "next_id": self.brain.next_id
+            "ctx": self.ctx[-self.ctx_window:]
         })
-        # Save nodes
-        nodes = {str(k): list(v) for k, v in self.brain.val.items()}
-        self._wjson(SELF / "brain" / "nodes.json", nodes)
-        # Save edges
-        edges = {str(src): {str(tgt): w for tgt, w in tgts.items()} 
-                 for src, tgts in self.brain.edges.items()}
-        self._wjson(SELF / "brain" / "edges.json", edges)
 
-    def _load(self):
+    def _load_state(self):
         try:
             s = self._rjson(SELF / "state.json")
             self.seed = s.get("seed", "")
@@ -776,22 +912,20 @@ class Qwile:
             self.correct = s.get("correct", 0)
             self.total = s.get("total", 0)
             self.ctx = s.get("ctx", [])
-            self.brain.next_id = s.get("next_id", 1)
         except Exception: pass
-        try:
-            nodes = self._rjson(SELF / "brain" / "nodes.json")
-            for k, v in nodes.items():
-                bval = bytes(v)
-                nid = int(k)
-                self.brain.val[nid] = bval
-                self.brain.id_map[bval] = nid
-        except Exception: pass
+
+    def _migrate_json_to_db(self):
+        self._say("migrating JSON edges to SQLite...")
         try:
             edges = self._rjson(SELF / "brain" / "edges.json")
             for src, tgts in edges.items():
                 for tgt, w in tgts.items():
-                    self.brain.edges[int(src)][int(tgt)] = float(w)
-        except Exception: pass
+                    self.brain.add_edge(int(src), int(tgt), float(w), commit=False)
+            self.brain.conn.commit()
+            (SELF / "brain" / "edges.json").unlink(missing_ok=True)
+            (SELF / "brain" / "nodes.json").unlink(missing_ok=True)
+        except Exception as e:
+            self._say(f"migration error: {e}")
 
     @staticmethod
     def _wjson(path, data):
@@ -815,13 +949,12 @@ class Qwile:
             cmd = parts[0].lower()
             arg = parts[1] if len(parts) > 1 else ""
             if cmd == "/sleep": self._sleep()
-            elif cmd == "/learn" and arg: self._learn(arg)
+            elif cmd == "/learn": self._learn(arg)
             else: self._say(f"unknown: {cmd}")
             return
 
         # System 1: Perceive & Understand
-        data = s.encode("utf-8")
-        nids = self._perceive(data)
+        nids = self._perceive(s)
         hits = self.understand(nids)
         acc = hits / max(1, len(nids)) * 100
 
@@ -838,20 +971,32 @@ class Qwile:
         self._help()
         try:
             while self.alive:
-                try: line = input("  > ")
-                except EOFError: break
+                try: 
+                    line = input("  > ")
+                except KeyboardInterrupt:
+                    print()
+                    self._say("shutting down.")
+                    break
+                except EOFError: 
+                    break
+                    
                 if line.strip():
-                    self._process(line)
+                    try:
+                        self._process(line)
+                    except KeyboardInterrupt:
+                        print()
+                        self._say("process interrupted.")
                     self.last_input = time.time()
                 else:
                     idle = time.time() - self.last_input
                     dynamic_sleep = max(10, self.sleep_after + self.mood * 15)
                     if idle > dynamic_sleep:
-                        self._sleep()
+                        try:
+                            self._sleep()
+                        except KeyboardInterrupt:
+                            print()
+                            self._say("sleep interrupted.")
                         self.last_input = time.time()
-        except KeyboardInterrupt:
-            print()
-            self._say("interrupted")
         finally:
             self._save()
             self._say("state saved. goodbye.")

@@ -1,9 +1,12 @@
-# Qwile's memory — unique to each instance
-self/*
-!self/README.md
-!qw1le.py
+# Qwile's memory (Digital Organism State)
+self/
+!self/.keep
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+
+# OS Files
+.DS_Store
+Thumbs.db
