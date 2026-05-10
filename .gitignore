@@ -1,12 +1,6 @@
-# Qwile's memory (Digital Organism State)
 self/
-!self/.keep
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-
-# OS Files
-.DS_Store
-Thumbs.db
+*.pyc
+*.pyo
+*.db-journal
+*.db-wal
