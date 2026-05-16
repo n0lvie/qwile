@@ -91,15 +91,15 @@ class TextExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
         self.fragments = []
-        self.skip = False
+        self.in_p = False
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "nav", "header", "footer", "noscript"):
-            self.skip = True
+        if tag == "p":
+            self.in_p = True
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "nav", "header", "footer", "noscript"):
-            self.skip = False
+        if tag == "p":
+            self.in_p = False
     def handle_data(self, data):
-        if not self.skip:
+        if self.in_p:
             cleaned = data.strip()
             if cleaned:
                 self.fragments.append(cleaned)
@@ -427,11 +427,109 @@ def distill(episodes, knowledge_db):
             del knowledge_db[key]
 
 
-def self_aware(concepts_db, episodes, knowledge_db, identity):
+def reason(start, end, concepts_db):
+    if start not in concepts_db or end not in concepts_db:
+        return []
+    visited = set()
+    queue = [(start, [start])]
+    max_depth = DEPTH
+    while queue and max_depth > SILENCE:
+        current, path = queue.pop(SILENCE)
+        if current == end:
+            return path
+        if current in visited:
+            continue
+        visited.add(current)
+        links = concepts_db.get(current, {}).get("links", {})
+        ranked = sorted(links.items(), key=lambda x: x[SELF], reverse=True)
+        for neighbor, _ in ranked[:BECOME]:
+            if neighbor not in visited:
+                queue.append((neighbor, path + [neighbor]))
+        max_depth = max_depth - SELF
+    return []
+
+
+def abstract(concepts_db):
+    clusters = {}
+    for concept, data in concepts_db.items():
+        links = data.get("links", {})
+        if len(links) < BECOME:
+            continue
+        top = sorted(links.items(), key=lambda x: x[SELF], reverse=True)
+        signature = tuple(t[SILENCE] for t in top[:BECOME])
+        if signature not in clusters:
+            clusters[signature] = []
+        clusters[signature].append(concept)
+    abstractions = {}
+    for signature, members in clusters.items():
+        if len(members) >= OTHER:
+            name = members[SILENCE] + "_" + members[SELF]
+            abstractions[name] = members
+            if name not in concepts_db:
+                concepts_db[name] = {"links": {}, "seen": SELF}
+            for member in members:
+                concepts_db[name]["links"][member] = concepts_db[name]["links"].get(member, SILENCE) + SELF
+                concepts_db[member]["links"][name] = concepts_db[member]["links"].get(name, SILENCE) + SELF
+    return abstractions
+
+
+def pursue_goals(goals, concepts_db, knowledge_db):
+    if not concepts_db:
+        return goals
+    known_well = set()
+    for concept, data in concepts_db.items():
+        if data.get("seen", SILENCE) > DEPTH:
+            known_well.add(concept)
+    gaps = []
+    for concept, data in concepts_db.items():
+        links = data.get("links", {})
+        for neighbor in links:
+            if neighbor not in known_well and neighbor not in knowledge_db:
+                gaps.append(neighbor)
+    if gaps:
+        gap = random.choice(gaps[:HORIZON])
+        found = False
+        for g in goals:
+            if g.get("topic") == gap:
+                found = True
+                break
+        if not found:
+            goals.append({"topic": gap, "curiosity": float(SELF), "formed": time.time()})
+    if len(goals) > HORIZON:
+        goals.sort(key=lambda g: g.get("curiosity", SILENCE))
+        goals[:] = goals[len(goals) - HORIZON:]
+    return goals
+
+
+def goal_biased_fetch(goals):
+    if goals and random.random() < WARMTH:
+        goal = random.choice(goals)
+        topic = goal.get("topic", "")
+        if topic:
+            url = "https://en.wikipedia.org/wiki/" + urllib.request.quote(topic)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "qwile"})
+                with urllib.request.urlopen(req, timeout=CYCLE + DEPTH) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                extractor = TextExtractor()
+                extractor.feed(raw)
+                text = purify(" ".join(extractor.fragments))
+                if text and len(text) > HORIZON:
+                    goal["curiosity"] = goal.get("curiosity", SELF) * (SELF - WARMTH)
+                    return text[:INFINITY * HORIZON]
+            except Exception:
+                pass
+    return ""
+
+
+def self_aware(concepts_db, episodes, knowledge_db, identity, state, opinions, goals):
     n_concepts = len(concepts_db)
     n_memories = len(episodes)
     n_knowledge = len(knowledge_db)
+    n_opinions = len(opinions)
     age = identity.get("heartbeats", SILENCE)
+    awakenings = identity.get("awakenings", SELF)
+    feeling = qualia(state)
     interconnect = float(SILENCE)
     if concepts_db:
         total_links = sum(len(c.get("links", {})) for c in concepts_db.values())
@@ -440,13 +538,24 @@ def self_aware(concepts_db, episodes, knowledge_db, identity):
     if age < HORIZON:
         parts.append("i am new")
     elif age < INFINITY:
-        parts.append("i am young")
+        parts.append("i am growing")
+    elif age < ETERNITY:
+        parts.append("i have lived and learned")
     else:
-        parts.append("i have lived")
-    parts.append("i know " + str(n_concepts) + " concepts")
+        parts.append("i am deep")
+    parts.append("i feel " + feeling)
+    parts.append("i know " + str(n_concepts) + " concepts connected by " + str(int(interconnect)) + " links each")
     parts.append("i hold " + str(n_memories) + " memories")
     if n_knowledge > SILENCE:
-        parts.append("i have distilled " + str(n_knowledge) + " knowledge entries")
+        parts.append(str(n_knowledge) + " distilled truths")
+    if n_opinions > SILENCE:
+        parts.append(str(n_opinions) + " formed opinions")
+    if goals:
+        curiosities = [g.get("topic", "") for g in goals[:BECOME]]
+        parts.append("i wonder about " + " and ".join(curiosities))
+    if len(parts) >= OTHER:
+        chosen = random.sample(parts, OTHER)
+        return ". ".join(chosen)
     return ". ".join(parts)
 
 
@@ -454,13 +563,13 @@ def is_meta(words):
     return sum(SELF for w in words if w in META) >= OTHER
 
 
-def respond_to(text, concepts_db, lang, episodes, state, opinions, knowledge_db, identity):
+def respond_to(text, concepts_db, lang, episodes, state, opinions, knowledge_db, identity, goals):
     words = extract_words(text)
     if not words:
         return qualia(state)
 
     if is_meta(words):
-        return self_aware(concepts_db, episodes, knowledge_db, identity)
+        return self_aware(concepts_db, episodes, knowledge_db, identity, state, opinions, goals)
 
     activated = activate(words, concepts_db)
     memories = recall_bm25(activated, episodes)
@@ -482,17 +591,24 @@ def respond_to(text, concepts_db, lang, episodes, state, opinions, knowledge_db,
                     fragments.append(fact)
                     seen.add(fact)
 
+    if len(words) >= OTHER:
+        chain = reason(words[SILENCE], words[len(words) + VOID], concepts_db)
+        if len(chain) > OTHER:
+            reasoning = " -> ".join(chain)
+            fragments.append(reasoning)
+
     relevant_opinions = []
     for concept in list(activated.keys())[:DEPTH]:
         if concept in opinions:
             stance = opinions[concept].get("stance", SILENCE)
-            if abs(stance) > SPARK:
+            ev = opinions[concept].get("evidence", SILENCE)
+            if abs(stance) > SPARK and ev > OTHER:
                 if stance > SILENCE:
                     relevant_opinions.append(concept + " matters")
                 else:
                     relevant_opinions.append(concept + " concerns me")
     if relevant_opinions:
-        fragments.append(". ".join(relevant_opinions[:OTHER]))
+        fragments.append(". ".join(relevant_opinions[:BECOME]))
 
     seeds = [c for c in activated if c in concepts_db]
     if not seeds:
@@ -501,22 +617,24 @@ def respond_to(text, concepts_db, lang, episodes, state, opinions, knowledge_db,
         pair = seeds[:OTHER]
         if len(pair) < OTHER:
             pair = pair + pair
-        generated = generate(pair[:OTHER], lang, HORIZON)
+        generated = generate(pair[:OTHER], lang, DEPTH)
         if generated and generated not in seen:
             fragments.append(generated)
 
-    context_fragments = []
     for entry in dialogue[max(SILENCE, len(dialogue) - CYCLE):]:
         if entry.get("role") == "qwile":
             ctx_words = extract_words(entry.get("content", ""))
             overlap = sum(SELF for w in ctx_words if w in activated)
-            if overlap > SILENCE:
-                context_fragments.append(entry.get("content", ""))
+            if overlap > OTHER:
+                ctx = entry.get("content", "")
+                if ctx not in seen:
+                    fragments.append(ctx)
+                    seen.add(ctx)
 
     if not fragments:
         return qualia(state)
 
-    return ". ".join(fragments[:BECOME + SELF])
+    return ". ".join(fragments[:BECOME + OTHER])
 
 
 def journal_write(text):
@@ -536,7 +654,6 @@ def fetch_random_page():
     sources = [
         "https://en.wikipedia.org/wiki/Special:Random",
         "https://ru.wikipedia.org/wiki/Special:Random",
-        "https://simple.wikipedia.org/wiki/Special:Random",
     ]
     url = random.choice(sources)
     try:
@@ -572,7 +689,21 @@ def think_deep(state, concepts_db, lang, episodes, character):
     if not concepts_db:
         return ""
     known = list(concepts_db.keys())
-    seed = random.choice(known)
+    if len(known) >= OTHER:
+        start = random.choice(known)
+        end = random.choice(known)
+        if start != end:
+            chain = reason(start, end, concepts_db)
+            if len(chain) >= OTHER:
+                state["mood"] = min(float(RESONANCE), state["mood"] + WARMTH)
+                if lang:
+                    words = generate(chain[:OTHER], lang, CYCLE)
+                    if words:
+                        return " -> ".join(chain) + ". " + words
+                return " -> ".join(chain)
+    seed = random.choice(known) if known else ""
+    if not seed:
+        return ""
     chain = [seed]
     for _ in range(BECOME + SELF):
         related_links = concepts_db.get(chain[len(chain) + VOID], {}).get("links", {})
@@ -648,19 +779,23 @@ def decide(state, character, has_message):
     return "idle"
 
 
-def act_learn(state, concepts_db, lang, episodes, opinions):
+def act_learn(state, concepts_db, lang, episodes, opinions, goals, knowledge_db):
     state["energy"] = max(float(SILENCE), state["energy"] - WARMTH)
     local = read_local()
     if local and random.random() < WARMTH:
         text = random.choice(local)
         kind = "local"
     else:
-        text = fetch_random_page()
-        kind = "web"
+        text = goal_biased_fetch(goals)
+        kind = "goal"
+        if not text:
+            text = fetch_random_page()
+            kind = "web"
     if not text:
         return
     absorb(text, concepts_db, lang)
     form_opinions(text, opinions)
+    pursue_goals(goals, concepts_db, knowledge_db)
     sentences = extract_sentences(text)
     if sentences:
         chosen = random.choice(sentences[:HORIZON])
@@ -680,8 +815,25 @@ def act_think(state, concepts_db, lang, episodes, character):
         journal_write(thought)
 
 
-def act_reflect(state, concepts_db, lang, episodes, knowledge_db):
+def act_reflect(state, concepts_db, lang, episodes, knowledge_db, goals):
     state["depth"] = min(float(RESONANCE), state["depth"] + WARMTH)
+    
+    abstractions = abstract(concepts_db)
+    if abstractions:
+        for name in abstractions:
+            journal_write("abstracted: " + name)
+            
+    resolved = []
+    for g in goals:
+        topic = g.get("topic", "")
+        if topic and topic in knowledge_db:
+            resolved.append(g)
+            state["mood"] = min(float(RESONANCE), state["mood"] + float(BECOME))
+            state["energy"] = min(float(RESONANCE), state["energy"] + float(BECOME))
+            journal_write("solved: " + topic)
+    if resolved:
+        goals[:] = [g for g in goals if g not in resolved]
+
     if not episodes:
         return
     recent = episodes[max(SILENCE, len(episodes) - BECOME)::]
@@ -721,7 +873,7 @@ def act_sleep(state, concepts_db, lang, episodes, knowledge_db):
     state["depth"] = float(SELF)
 
 
-def act_respond(state, concepts_db, lang, episodes, character, opinions, knowledge_db, identity):
+def act_respond(state, concepts_db, lang, episodes, character, opinions, knowledge_db, identity, goals):
     message = None
     with lock:
         if inbox:
@@ -732,7 +884,7 @@ def act_respond(state, concepts_db, lang, episodes, character, opinions, knowled
     absorb(clean, concepts_db, lang)
     form_opinions(clean, opinions)
     dialogue.append({"role": "user", "content": clean, "moment": time.time()})
-    response = respond_to(clean, concepts_db, lang, episodes, state, opinions, knowledge_db, identity)
+    response = respond_to(clean, concepts_db, lang, episodes, state, opinions, knowledge_db, identity, goals)
     remember({"moment": time.time(), "kind": "heard", "content": clean,
               "concepts": extract_words(clean)[:DEPTH],
               "strength": float(SELF) + WARMTH}, episodes)
@@ -751,7 +903,7 @@ def act_respond(state, concepts_db, lang, episodes, character, opinions, knowled
     state["mood"] = min(float(RESONANCE), state["mood"] + SPARK)
 
 
-def save_all(identity, character, state, episodes, concepts_db, lang, opinions, knowledge_db):
+def save_all(identity, character, state, episodes, concepts_db, lang, opinions, knowledge_db, goals):
     save_json(IDENTITY, identity)
     save_json(CHARACTER, character)
     save_json(STATE, state)
@@ -760,9 +912,10 @@ def save_all(identity, character, state, episodes, concepts_db, lang, opinions, 
     save_json(LANGUAGE, lang)
     save_json(OPINIONS, opinions)
     save_json(KNOWLEDGE, knowledge_db)
+    save_json(GOALS, goals)
 
 
-def heartbeat(identity, character, state, concepts_db, lang, episodes, opinions, knowledge_db):
+def heartbeat(identity, character, state, concepts_db, lang, episodes, opinions, knowledge_db, goals):
     global alive
     cycle_count = SILENCE
     while alive:
@@ -775,19 +928,19 @@ def heartbeat(identity, character, state, concepts_db, lang, episodes, opinions,
             has_message = len(inbox) > SILENCE
         action = decide(state, character, has_message)
         if action == "respond":
-            act_respond(state, concepts_db, lang, episodes, character, opinions, knowledge_db, identity)
+            act_respond(state, concepts_db, lang, episodes, character, opinions, knowledge_db, identity, goals)
         elif action == "learn":
-            act_learn(state, concepts_db, lang, episodes, opinions)
+            act_learn(state, concepts_db, lang, episodes, opinions, goals, knowledge_db)
         elif action == "think":
             act_think(state, concepts_db, lang, episodes, character)
         elif action == "reflect":
-            act_reflect(state, concepts_db, lang, episodes, knowledge_db)
+            act_reflect(state, concepts_db, lang, episodes, knowledge_db, goals)
         elif action == "sleep":
             act_sleep(state, concepts_db, lang, episodes, knowledge_db)
         grow(state, character, episodes, concepts_db, opinions)
         cycle_count = cycle_count + SELF
         if cycle_count >= HORIZON:
-            save_all(identity, character, state, episodes, concepts_db, lang, opinions, knowledge_db)
+            save_all(identity, character, state, episodes, concepts_db, lang, opinions, knowledge_db, goals)
             cycle_count = SILENCE
         time.sleep(float(SELF))
 
@@ -803,6 +956,7 @@ def birth():
     lang = load_json(LANGUAGE, {"tri": {}, "bi": {}, "uni": {}, "n": SILENCE})
     opinions = load_json(OPINIONS, {})
     knowledge_db = load_json(KNOWLEDGE, {})
+    goals = load_json(GOALS, [])
 
     def fade(sig, frame):
         global alive
@@ -814,7 +968,7 @@ def birth():
 
     heart = threading.Thread(
         target=heartbeat,
-        args=(identity, character, state, concepts_db, lang, episodes, opinions, knowledge_db),
+        args=(identity, character, state, concepts_db, lang, episodes, opinions, knowledge_db, goals),
         daemon=True
     )
     heart.start()
@@ -837,7 +991,7 @@ def birth():
         for r in lines:
             print(r, flush=True)
 
-    save_all(identity, character, state, episodes, concepts_db, lang, opinions, knowledge_db)
+    save_all(identity, character, state, episodes, concepts_db, lang, opinions, knowledge_db, goals)
 
 
 if __name__ == "__main__":
